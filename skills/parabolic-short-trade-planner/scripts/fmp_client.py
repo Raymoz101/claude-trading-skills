@@ -121,6 +121,7 @@ class FMPClient:
     """Client for Financial Modeling Prep API with rate limiting and caching"""
 
     BASE_URL = "https://financialmodelingprep.com/api/v3"
+    STABLE_URL = "https://financialmodelingprep.com/stable"
     RATE_LIMIT_DELAY = 0.3  # 300ms between requests
 
     _ENDPOINT_FAILURE_THRESHOLD = 3  # disable endpoint after N consecutive failures
@@ -279,8 +280,11 @@ class FMPClient:
         if cache_key in self.cache:
             return self.cache[cache_key]
 
-        url = f"{self.BASE_URL}/sp500_constituent"
-        data = self._rate_limited_get(url)
+        # stable: /sp500-constituent (hyphen). Fall back to v3 /sp500_constituent
+        # (underscore) for legacy keys. Both return the same list shape.
+        data = self._rate_limited_get(f"{self.STABLE_URL}/sp500-constituent", quiet=True)
+        if not data:
+            data = self._rate_limited_get(f"{self.BASE_URL}/sp500_constituent")
         if data:
             self.cache[cache_key] = data
         return data
@@ -340,15 +344,23 @@ class FMPClient:
     def get_company_profile(self, symbol: str) -> Optional[dict]:
         """Fetch company profile (market cap, IPO date, sector, etc.).
 
-        Uses ``/api/v3/profile/{symbol}``. Returns ``None`` on failure.
+        Uses ``/stable/profile?symbol=`` with a v3 ``/profile/{symbol}``
+        fallback for legacy keys. /stable renamed ``mktCap`` -> ``marketCap``;
+        a ``mktCap`` alias is added so downstream readers keep working.
+        Returns ``None`` on failure.
         """
         cache_key = f"profile_{symbol}"
         if cache_key in self.cache:
             return self.cache[cache_key]
-        url = f"{self.BASE_URL}/profile/{symbol}"
-        data = self._rate_limited_get(url)
+        data = self._rate_limited_get(
+            f"{self.STABLE_URL}/profile", params={"symbol": symbol}, quiet=True
+        )
+        if not (isinstance(data, list) and data):
+            data = self._rate_limited_get(f"{self.BASE_URL}/profile/{symbol}")
         if isinstance(data, list) and data:
             profile = data[0]
+            if "mktCap" not in profile and "marketCap" in profile:
+                profile["mktCap"] = profile["marketCap"]
             self.cache[cache_key] = profile
             return profile
         return None
@@ -369,12 +381,20 @@ class FMPClient:
         return None
 
     def get_earnings_calendar(self, from_date: str, to_date: str) -> Optional[list[dict]]:
-        """Fetch upcoming earnings between two dates (YYYY-MM-DD)."""
+        """Fetch upcoming earnings between two dates (YYYY-MM-DD).
+
+        Uses /stable/earnings-calendar with a v3 /earning_calendar fallback for
+        legacy keys.
+        """
         cache_key = f"earnings_{from_date}_{to_date}"
         if cache_key in self.cache:
             return self.cache[cache_key]
-        url = f"{self.BASE_URL}/earning_calendar"
-        data = self._rate_limited_get(url, params={"from": from_date, "to": to_date})
+        params = {"from": from_date, "to": to_date}
+        data = self._rate_limited_get(
+            f"{self.STABLE_URL}/earnings-calendar", params=params, quiet=True
+        )
+        if not data:
+            data = self._rate_limited_get(f"{self.BASE_URL}/earning_calendar", params=params)
         if isinstance(data, list):
             self.cache[cache_key] = data
         return data
