@@ -14,6 +14,8 @@ Features:
 - Earnings calendar and historical price fetching
 """
 
+import csv
+import io
 import os
 import sys
 import time
@@ -113,9 +115,11 @@ class FMPClient:
     """Client for Financial Modeling Prep API with rate limiting, caching, and budget control"""
 
     BASE_URL = "https://financialmodelingprep.com/api/v3"
+    STABLE_URL = "https://financialmodelingprep.com/stable"
     RATE_LIMIT_DELAY = 0.3  # 300ms between requests
 
     _ENDPOINT_FAILURE_THRESHOLD = 3  # disable endpoint after N consecutive failures
+    _PROFILE_BULK_MAX_PARTS = 30  # safety cap on profile-bulk pagination
 
     def __init__(self, api_key: Optional[str] = None, max_api_calls: int = 200):
         self.api_key = api_key or os.getenv("FMP_API_KEY")
@@ -136,11 +140,16 @@ class FMPClient:
         # Circuit breaker: track consecutive failures per endpoint URL prefix
         self._endpoint_failures: dict[str, int] = {}
         self._disabled_endpoints: set[str] = set()
+        # Lazily-loaded {SYMBOL: profile} map from /stable/profile-bulk
+        self._profile_bulk: Optional[dict[str, dict]] = None
 
     def _rate_limited_get(
-        self, url: str, params: Optional[dict] = None, quiet: bool = False
-    ) -> Optional[dict]:
+        self, url: str, params: Optional[dict] = None, quiet: bool = False, raw: bool = False
+    ):
         """Make a rate-limited GET request with budget enforcement.
+
+        Returns parsed JSON by default, or the raw response text when
+        ``raw=True`` (used for the CSV profile-bulk endpoint).
 
         Raises:
             ApiCallBudgetExceeded: When api_calls_made >= max_api_calls
@@ -167,13 +176,13 @@ class FMPClient:
 
             if response.status_code == 200:
                 self.retry_count = 0
-                return response.json()
+                return response.text if raw else response.json()
             elif response.status_code == 429:
                 self.retry_count += 1
                 if self.retry_count <= self.max_retries:
                     print("WARNING: Rate limit exceeded. Waiting 60 seconds...", file=sys.stderr)
                     time.sleep(60)
-                    return self._rate_limited_get(url, params, quiet=quiet)
+                    return self._rate_limited_get(url, params, quiet=quiet, raw=raw)
                 else:
                     print("ERROR: Daily API rate limit reached.", file=sys.stderr)
                     self.rate_limit_reached = True
@@ -273,49 +282,129 @@ class FMPClient:
             to_date: End date in YYYY-MM-DD format
 
         Returns:
-            List of earnings event dicts or None on failure.
-            Each dict contains: date, symbol, eps, epsEstimated, revenue,
-            revenueEstimated, time (bmo/amc)
+            List of earnings event dicts or None on failure. Each dict carries
+            at least ``symbol`` and ``date`` (plus epsActual/epsEstimated/
+            revenueActual/revenueEstimated). The /stable calendar no longer
+            reports an intraday ``time`` (BMO/AMC) field; callers treat a
+            missing time as unknown.
         """
         cache_key = f"earnings_{from_date}_{to_date}"
         if cache_key in self.cache:
             return self.cache[cache_key]
 
-        url = f"{self.BASE_URL}/earning_calendar"
         params = {"from": from_date, "to": to_date}
-        data = self._rate_limited_get(url, params)
+        # stable: /earnings-calendar (hyphen). Fall back to v3 /earning_calendar
+        # (underscore) for legacy keys issued before the /stable cutover.
+        data = self._rate_limited_get(f"{self.STABLE_URL}/earnings-calendar", params, quiet=True)
+        if not data:
+            data = self._rate_limited_get(f"{self.BASE_URL}/earning_calendar", params)
         if data:
             self.cache[cache_key] = data
         return data
 
-    def get_company_profiles(self, symbols: list[str]) -> dict[str, dict]:
-        """Fetch company profiles for multiple symbols in batches.
+    @staticmethod
+    def _to_number(value):
+        """Coerce a CSV/string numeric field to float; None/'' -> 0."""
+        if value in (None, ""):
+            return 0
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return value
 
-        Args:
-            symbols: List of stock symbols
+    @classmethod
+    def _v3_compat_profile(cls, profile: dict) -> dict:
+        """Add v3-compatible aliases so downstream filters keep working.
 
-        Returns:
-            Dict mapping symbol -> profile dict (with marketCap, sector, etc.)
+        /stable/profile (and profile-bulk) renamed some v3 fields:
+        marketCap -> mktCap, exchange -> exchangeShortName. Numeric fields from
+        the CSV bulk endpoint arrive as strings and are coerced here.
         """
-        results = {}
+        if "mktCap" not in profile and "marketCap" in profile:
+            profile["mktCap"] = profile["marketCap"]
+        if "exchangeShortName" not in profile and "exchange" in profile:
+            profile["exchangeShortName"] = profile["exchange"]
+        for key in ("mktCap", "marketCap", "price"):
+            if key in profile:
+                profile[key] = cls._to_number(profile[key])
+        return profile
+
+    def _load_profile_bulk(self) -> dict[str, dict]:
+        """Download and cache the full {SYMBOL: profile} map from profile-bulk.
+
+        /stable has no batch profile endpoint (comma-batched ?symbol= silently
+        returns []), so a global symbol list is served from FMP's bulk CSV dump
+        instead. The dump is paginated by ``part``; parts are fetched until one
+        comes back empty/non-CSV (a handful of calls), then cached for the
+        session. Returns {} when the bulk endpoint is unavailable (e.g. a legacy
+        key), letting the caller fall back to the v3 batched endpoint.
+        """
+        if self._profile_bulk is not None:
+            return self._profile_bulk
+
+        table: dict[str, dict] = {}
+        for part in range(self._PROFILE_BULK_MAX_PARTS):
+            text = self._rate_limited_get(
+                f"{self.STABLE_URL}/profile-bulk", {"part": part}, quiet=True, raw=True
+            )
+            if not text or not text.lstrip().startswith('"symbol"'):
+                break  # no more parts (empty body or an error/JSON message)
+            added = 0
+            for row in csv.DictReader(io.StringIO(text)):
+                sym = (row.get("symbol") or "").strip().upper()
+                if sym:
+                    table[sym] = self._v3_compat_profile(dict(row))
+                    added += 1
+            if added == 0:
+                break
+        self._profile_bulk = table
+        return table
+
+    def _get_company_profiles_v3(self, symbols: list[str]) -> dict[str, dict]:
+        """Legacy fallback: v3 batched profile endpoint (for pre-cutover keys)."""
+        results: dict[str, dict] = {}
         batch_size = 100
         for i in range(0, len(symbols), batch_size):
             batch = symbols[i : i + batch_size]
             batch_str = ",".join(batch)
-
-            cache_key = f"profile_{batch_str}"
-            if cache_key in self.cache:
-                for profile in self.cache[cache_key]:
-                    results[profile["symbol"]] = profile
-                continue
-
-            url = f"{self.BASE_URL}/profile/{batch_str}"
-            data = self._rate_limited_get(url)
+            cache_key = f"profiles_v3_{batch_str}"
+            data = self.cache.get(cache_key)
+            if data is None:
+                data = self._rate_limited_get(f"{self.BASE_URL}/profile/{batch_str}")
+                if data:
+                    self.cache[cache_key] = data
             if data:
-                self.cache[cache_key] = data
                 for profile in data:
-                    results[profile["symbol"]] = profile
+                    if isinstance(profile, dict) and profile.get("symbol"):
+                        results[profile["symbol"]] = self._v3_compat_profile(profile)
         return results
+
+    def get_company_profiles(self, symbols: list[str]) -> dict[str, dict]:
+        """Map ticker symbols to company profile data.
+
+        /stable has no batch profile endpoint, so the full profile universe is
+        downloaded once via /stable/profile-bulk (a handful of CSV calls,
+        cached for the session) and the requested symbols are looked up locally
+        — far cheaper than one request per symbol for the large earnings-calendar
+        universe. Falls back to the v3 batched profile endpoint for legacy keys
+        where profile-bulk is unavailable.
+
+        Returns:
+            Dict mapping symbol -> profile dict (with v3-compatible mktCap /
+            exchangeShortName fields).
+        """
+        bulk = self._load_profile_bulk()
+        if bulk:
+            results = {}
+            for symbol in symbols:
+                profile = bulk.get(symbol.strip().upper())
+                if profile:
+                    results[symbol] = profile
+            if results:
+                return results
+
+        # Legacy fallback (e.g. a pre-cutover v3 key that can't use profile-bulk)
+        return self._get_company_profiles_v3(symbols)
 
     def get_historical_prices(self, symbol: str, days: int = 90) -> Optional[dict]:
         """Fetch historical daily OHLCV data.
