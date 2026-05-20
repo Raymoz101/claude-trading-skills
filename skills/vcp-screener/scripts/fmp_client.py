@@ -121,6 +121,7 @@ class FMPClient:
     """Client for Financial Modeling Prep API with rate limiting and caching"""
 
     BASE_URL = "https://financialmodelingprep.com/api/v3"
+    STABLE_URL = "https://financialmodelingprep.com/stable"
     RATE_LIMIT_DELAY = 0.3  # 300ms between requests
 
     _ENDPOINT_FAILURE_THRESHOLD = 3  # disable endpoint after N consecutive failures
@@ -279,8 +280,11 @@ class FMPClient:
         if cache_key in self.cache:
             return self.cache[cache_key]
 
-        url = f"{self.BASE_URL}/sp500_constituent"
-        data = self._rate_limited_get(url)
+        # stable: /sp500-constituent (hyphen). Fall back to v3 /sp500_constituent
+        # (underscore) for legacy keys. Both return the same list shape.
+        data = self._rate_limited_get(f"{self.STABLE_URL}/sp500-constituent", quiet=True)
+        if not data:
+            data = self._rate_limited_get(f"{self.BASE_URL}/sp500_constituent")
         if data:
             self.cache[cache_key] = data
         return data
@@ -308,13 +312,15 @@ class FMPClient:
         return data
 
     def get_batch_quotes(self, symbols: list[str]) -> dict[str, dict]:
-        """Fetch quotes for a list of symbols, batching up to 5 per request"""
+        """Fetch quotes for a list of symbols, one symbol per request.
+
+        FMP's /stable/quote does NOT support comma-batched symbols (that is a
+        paid legacy feature and silently returns []), so each symbol is fetched
+        individually. get_quote() rate-limits and caches each call.
+        """
         results = {}
-        batch_size = 5
-        for i in range(0, len(symbols), batch_size):
-            batch = symbols[i : i + batch_size]
-            batch_str = ",".join(batch)
-            quotes = self.get_quote(batch_str)
+        for symbol in symbols:
+            quotes = self.get_quote(symbol)
             if quotes:
                 for q in quotes:
                     results[q["symbol"]] = q
