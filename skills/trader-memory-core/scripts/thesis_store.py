@@ -228,7 +228,11 @@ def _generate_thesis_id(ticker: str, thesis_type: str, date_str: str) -> str:
         )
     salt = uuid.uuid4().hex[:8]
     hash4 = hashlib.sha256(f"{ticker}_{thesis_type}_{date_str}_{salt}".encode()).hexdigest()[:4]
-    return f"th_{ticker.lower()}_{abbr}_{date_str}_{hash4}"
+    # The schema requires the ID's ticker slug to be [A-Za-z0-9]+, so dotted symbols
+    # (e.g. ASX "EVN.AX") must drop the dot here or validation fails. Only the slug is
+    # sanitized — the thesis's stored `ticker` field keeps the real symbol.
+    slug = re.sub(r"[^a-z0-9]", "", ticker.lower()) or "x"
+    return f"th_{slug}_{abbr}_{date_str}_{hash4}"
 
 
 def _compute_origin_fingerprint(thesis_data: dict) -> str:

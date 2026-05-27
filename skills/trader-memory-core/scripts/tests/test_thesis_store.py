@@ -61,6 +61,16 @@ def test_thesis_id_contains_hash4(tmp_path: Path):
     assert len(parts[4]) == 4  # hash4
 
 
+def test_dotted_ticker_id_is_schema_valid(tmp_path: Path):
+    """Dotted symbols (e.g. ASX 'EVN.AX') must slug to [A-Za-z0-9]+ in the ID so
+    schema validation passes — while the stored ticker keeps the real symbol."""
+    tid, thesis = _register_and_get(tmp_path, ticker="EVN.AX", thesis_type="growth_momentum")
+    parts = tid.split("_")
+    assert parts[1] == "evnax"  # dot dropped from the slug
+    assert "." not in tid
+    assert thesis["ticker"] == "EVN.AX"  # real symbol preserved on the record
+
+
 def test_same_input_idempotent(tmp_path: Path):
     """Same input data should return the same thesis_id (idempotent)."""
     tid1 = thesis_store.register(tmp_path, _make_thesis_data())
