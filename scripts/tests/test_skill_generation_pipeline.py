@@ -638,6 +638,16 @@ def test_daily_flow_success(pipeline_module, tmp_path: Path):
         # build_design_prompt
         if "build_design_prompt" in cmd_str:
             return CompletedProcess(cmd, 0, "design prompt text", "")
+        # reviewer (auto score) — check before "claude -p" because the reviewer command's
+        # --project-root path may contain "claude" and "--project-root" contains "-p"
+        if "run_dual_axis_review" in cmd_str:
+            # Create a report JSON
+            report_dir = tmp_path / "reports"
+            report_dir.mkdir(parents=True, exist_ok=True)
+            report = {"auto_review": {"score": 85, "improvement_items": []}}
+            report_path = report_dir / "skill_review_test-new-skill_2026.json"
+            report_path.write_text(json.dumps(report), encoding="utf-8")
+            return CompletedProcess(cmd, 0, "", "")
         # claude -p (design step) - also create SKILL.md as side effect
         if "claude" in cmd_str and "-p" in cmd_str:
             skill_dir = tmp_path / "skills" / "test-new-skill"
@@ -648,15 +658,6 @@ def test_daily_flow_success(pipeline_module, tmp_path: Path):
         if "diff" in cmd_str and "--name-only" in cmd_str and "HEAD" in cmd_str:
             return CompletedProcess(cmd, 0, "skills/test-new-skill/SKILL.md\n", "")
         if "ls-files" in cmd_str:
-            return CompletedProcess(cmd, 0, "", "")
-        # reviewer (auto score)
-        if "run_dual_axis_review" in cmd_str:
-            # Create a report JSON
-            report_dir = tmp_path / "reports"
-            report_dir.mkdir(parents=True, exist_ok=True)
-            report = {"auto_review": {"score": 85, "improvement_items": []}}
-            report_path = report_dir / "skill_review_test-new-skill_2026.json"
-            report_path.write_text(json.dumps(report), encoding="utf-8")
             return CompletedProcess(cmd, 0, "", "")
         # ruff
         if "ruff" in cmd_str:
